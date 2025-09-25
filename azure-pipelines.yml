@@ -1,0 +1,373 @@
+# -------------------------------
+# PaymentPackage – CI (release branch)
+# -------------------------------
+
+name: paymentpkg_release_$(Date:yyyyMMdd).$(Rev:r)
+
+trigger:
+  branches:
+    include:
+      - release
+  tags:
+    include:
+      - 'v*'
+
+pr:
+  branches:
+    include:
+      - release
+
+pool:
+  vmImage: macos-latest
+  
+variables:
+  # Link Library variable group (must contain: GITHUB_TOKEN [secret], GITHUB_REPO)
+  - group: PaymentPackage-Secrets
+  
+  # The pipeline variables
+  - name: GITHUB_DEFAULT_BRANCH
+    value: main
+  - name: CONFIG
+    value: release
+    
+  # SonarCloud
+  - name: SONAR_ENABLED
+    value: 'true'
+  - name: SONARQ_ENDPOINT
+    value: 'sonarcloud-paymentpackage'  # Service Connection name in azure DevOps
+  - name: SONAR_ORG
+    value: 'ciscode'
+  - name: SONAR_PROJECT_KEY
+    value: 'To be set later'
+  - name: SONAR_PROJECT_NAME
+    value: 'pkg-ios-payment'
+    
+  # Azure Artifacts feed (optional)
+  - name: FEED_PATH
+    value: '$(System.TeamProject)/ios-packages'
+  - name: PACKAGE_NAME
+    value: 'PaymentPackage'
+    
+  # Wil be overridden by version resolver
+  - name: PACKAGE_VERSION
+    value: '0.0.0-rc.0'
+    
+steps:
+  # Ensure later git commands reuse OAuth token
+  - checkout: seld
+    fetchDepth: 0
+    persistCredentials: true
+    displayName: "Checkout Repository"
+    
+  # Authenticated tag fetch (so versioning sees all tags)
+  - script: |
+      set -euo pipefail 
+      git -c http.extraheader="AUTHORIZATION: bearer $(System.AccessToken)" \
+          fetch --tags --force --prune origin 
+    displayName: "Fetch tags (auth)"
+    
+  # ---------------------------------------------
+  # Resolve PACKAGE_VERSION (simple)
+  # - Tag build (refs/tags/vX.Y.Z) => X.Y.Z
+  # - If X.Y.Z already exists in feed => bump to X.Y.(Z+1)
+  # - Non-tag build => NEXT_MINOR.0-rc.YYYYMMDD.BUILDID
+  # ---------------------------------------------
+  - script: |
+      set -euo pipefail
+      swift - <<'SWIFT'
+      import Foundation
+
+      struct Env {
+          static func get(_ key: String, required: Bool = true) -> String {
+              let v = ProcessInfo.processInfo.environment[key] ?? ""
+              if required && v.isEmpty { fputs("ERROR: missing env \(key)\n", stderr); exit(1) }
+              if v.hasPrefix("$(") && v.hasSuffix(")") { fputs("ERROR: unresolved placeholder \(key)\n", stderr); exit(1) }
+              return v
+          }
+      }
+      func setVar(_ name: String, _ value: String) { print("##vso[task.setvariable variable=\(name)]\(value)") }
+      func bumpPatch(_ version: String) -> String {
+          let parts = version.split(separator: ".").map(String.init)
+          guard parts.count == 3, let p = Int(parts[2]) else { return version }
+          return "\(parts[0]).\(parts[1]).\(p+1)"
+      }
+      func run(_ launchPath: String, _ args: [String]) -> (Int32, String) {
+          let task = Process()
+          task.launchPath = launchPath
+          task.arguments = args
+          let pipe = Pipe(); task.standardOutput = pipe
+          task.launch(); task.waitUntilExit()
+          let data = pipe.fileHandleForReading.readDataToEndOfFile()
+          return (task.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+      }
+
+      let REF = Env.get("BUILD_SOURCEBRANCH", required: true)
+      let buildId = Env.get("BUILD_BUILDID", required: true)
+      let feedPath = Env.get("FEED_PATH", required: true)
+      let packageName = Env.get("PACKAGE_NAME", required: true)
+      let orgUrlRaw = Env.get("SYSTEM_COLLECTIONURI", required: true)
+      let project = Env.get("SYSTEM_TEAMPROJECT", required: true)
+      let token = Env.get("System_AccessToken", required: true)
+
+      let orgUrl = orgUrlRaw.hasSuffix("/") ? String(orgUrlRaw.dropLast()) : orgUrlRaw
+      let feedName = feedPath.split(separator: "/").dropFirst().joined(separator: "/")
+      let baseApi = "\(orgUrl)/\(project)/_apis/packaging/feeds/\(feedName)"
+
+      if !REF.hasPrefix("refs/tags/v") {
+          var lastTag = ""
+          let (code1, out1) = run("/usr/bin/env", ["git","describe","--tags","--abbrev=0","--match","v[0-9]*"])
+          if code1 == 0 { lastTag = out1.trimmingCharacters(in: .whitespacesAndNewlines) }
+          if lastTag.isEmpty {
+              let (code2, out2) = run("/usr/bin/env", ["git","tag","-l","v[0-9]*","--sort=-v:refname"])
+              if code2 == 0 { lastTag = out2.split(separator: "\n").first.map(String.init) ?? "" }
+          }
+
+          var maj = 0, min = 0
+          if lastTag.hasPrefix("v") {
+              let base = String(lastTag.dropFirst())
+              let parts = base.split(separator: ".").map(String.init)
+              if parts.count >= 2 { maj = Int(parts[0]) ?? 0; min = Int(parts[1]) ?? 0 }
+          }
+          let nextMinor = "\(maj).\(min+1).0"
+          let date = ISO8601DateFormatter().string(from: Date()).prefix(10).replacingOccurrences(of: "-", with: "")
+          let ver = "\(nextMinor)-rc.\(date).\(buildId)"
+          print("RC build → PACKAGE_VERSION=\(ver)")
+          setVar("PACKAGE_VERSION", ver)
+          setVar("RELEASE_CHANNEL", "rc")
+          exit(0)
+      }
+
+      let desired = String(REF.dropFirst("refs/tags/v".count))
+      print("Tag build detected → desired = \(desired)")
+      setVar("RELEASE_CHANNEL", "stable")
+
+      func getJSON(url: URL, bearer: String) -> Any? {
+          var req = URLRequest(url: url)
+          req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+          let sem = DispatchSemaphore(value: 0)
+          var result: Any?
+          URLSession.shared.dataTask(with: req) { data, _, _ in
+              defer { sem.signal() }
+              guard let d = data else { return }
+              result = try? JSONSerialization.jsonObject(with: d, options: [])
+          }.resume()
+          sem.wait()
+          return result
+      }
+
+      let pkgURL = URL(string: "\(baseApi)/packages?packageNameQuery=\(packageName)&protocolType=upack&includeAllVersions=true&api-version=7.0-preview.1")!
+      let pkgJSON = getJSON(url: pkgURL, bearer: token) as? [String: Any]
+      let pkgId = ((pkgJSON?["value"] as? [[String: Any]])?.first?["id"] as? String) ?? ""
+
+      var effective = desired
+      if !pkgId.isEmpty {
+          let versURL = URL(string: "\(baseApi)/packages/\(pkgId)/versions?includeDeleted=false&isListed=true&api-version=7.0-preview.1")!
+          if let versJSON = getJSON(url: versURL, bearer: token) as? [String: Any],
+             let arr = versJSON["value"] as? [[String: Any]] {
+              let exists = arr.contains { ($0["version"] as? String) == desired }
+              if exists {
+                  effective = bumpPatch(desired)
+                  print("Version \(desired) already exists in feed → bumping to \(effective)")
+              } else {
+                  print("Version \(desired) not present in feed → using it")
+              }
+          }
+      } else {
+          print("Feed/package empty → using \(effective)")
+      }
+
+      setVar("PACKAGE_VERSION", effective)
+      print("Resolved PACKAGE_VERSION=\(effective)")
+      SWIFT
+    displayName: "Resolve package version (Swift)"
+    env:
+      System_AccessToken: $(System.AccessToken)
+
+  - script: |
+      set -euo pipefail
+      echo "Swift toolchain:"; swift --version
+      echo "Xcode:"; xcodebuild -version
+    displayName: "Show toolchain versions"
+
+  - script: |
+      set -euo pipefail
+      echo "Running SwiftPM tests with coverage…"
+      swift test --enable-code-coverage
+
+      if swift test --show-codecov-path >/dev/null 2>&1; then
+        CODECOV_JSON_PATH=$(swift test --show-codecov-path | tail -n1)
+        PROF_DIR=$(dirname "$CODECOV_JSON_PATH")
+        PROF="$PROF_DIR/default.profdata"
+      else
+        PROF=".build/debug/codecov/default.profdata"
+      fi
+
+      if swift test --show-test-binary-path >/dev/null 2>&1; then
+        TEST_BIN=$(swift test --show-test-binary-path)
+      else
+        TEST_BIN=$(find .build -type f -name '*Tests' -perm -111 2>/dev/null | head -n1)
+      fi
+
+      echo "Coverage profile: $PROF"
+      echo "Test binary: $TEST_BIN"
+
+      xcrun llvm-cov export -format=lcov -instr-profile "$PROF" "$TEST_BIN" > coverage.lcov
+      echo "Wrote coverage.lcov"
+      xcrun llvm-cov show "$TEST_BIN" -instr-profile "$PROF" > coverage.swift.txt
+      echo "Wrote coverage.swift.txt for SonarSwift"
+    displayName: "Build & test (with coverage)"
+
+  - script: |
+      set -euo pipefail
+      python3 -m pip install --user lcov_cobertura
+      python3 -m lcov_cobertura coverage.lcov --output coverage.cobertura.xml
+      echo "Wrote coverage.cobertura.xml"
+    displayName: "Convert coverage: LCOV → Cobertura XML"
+  
+  - task: PublishCodeCoverageResults@2
+    displayName: "Publish code coverage (Cobertura)"
+    inputs:
+      codeCoverageTool: Cobertura
+      summaryFileLocation: 'coverage.cobertura.xml'
+      reportDirectory: 'coverage-html'
+      failIfCoverageEmpty: false
+  
+  - script: |
+      set -euo pipefail
+      mkdir -p coverage-html
+      if swift test --show-codecov-path >/dev/null 2>&1; then
+        CODECOV_JSON_PATH=$(swift test --show-codecov-path | tail -n1)
+        PROF_DIR=$(dirname "$CODECOV_JSON_PATH")
+        PROF="$PROF_DIR/default.profdata"
+      else
+        PROF=".build/debug/codecov/default.profdata"
+      fi
+      if swift test --show-test-binary-path >/dev/null 2>&1; then
+        TEST_BIN=$(swift test --show-test-binary-path)
+      else
+        TEST_BIN=$(find .build -type f -name '*Tests' -perm -111 2>/dev/null | head -n1)
+      fi
+      xcrun llvm-cov show "$TEST_BIN" -instr-profile "$PROF" -format=html -output-dir coverage-html
+    displayName: "Generate HTML coverage (optional)"
+
+  - script: |
+      if [ -d coverage-html ]; then
+        echo "##vso[task.setvariable variable=PUBLISH_HTML]true"
+        echo "coverage-html exists, will publish."
+      else
+        echo "coverage-html is missing, skipping publish."
+      fi
+    displayName: "Check coverage-html existence"
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish coverage HTML (optional)"
+    condition: and(succeededOrFailed(), eq(variables['PUBLISH_HTML'], 'true'))
+    inputs:
+      targetPath: 'coverage-html'
+      artifact: 'coverage-html'
+  
+# ---- SonarCloud (v3 tasks) ----
+
+  - ${{ if eq(variables['SONAR_ENABLED'], 'true') }}:
+    - task: SonarCloudPrepare@3
+      displayName: "SonarCloud | Prepare analysis"
+      inputs:
+        SonarCloud: '$(SONARQ_ENDPOINT)'
+        organization: '$(SONAR_ORG)'
+        scannerMode: 'CLI'
+        configMode: 'file'
+        cliProjectKey: '$(SONAR_PROJECT_KEY)'
+        cliProjectName: '$(SONAR_PROJECT_NAME)'
+        extraProperties: |
+          sonar.projectVersion=$(Build.BuildNumber)
+          sonar.branch.name=$(Build.SourceBranchName)
+          sonar.scm.revision=$(Build.SourceVersion)
+
+    - task: SonarCloudAnalyze@3
+      displayName: "SonarCloud | Run analysis"
+
+    - task: SonarCloudPublish@3
+      displayName: "SonarCloud | Publish Quality Gate"
+      condition: succeeded()
+      inputs:
+        pollingTimeoutSec: '600'
+
+  - script: |
+      set -euo pipefail
+      echo "Building package in release mode…"
+      swift build -c "$(CONFIG)"
+    displayName: "Build package (release)"
+    condition: succeeded()
+
+  - script: |
+      set -euo pipefail
+      echo "Packaging source artifact…"
+      rm -rf dist && mkdir -p dist/pkg
+
+      cp -a Package.swift dist/pkg/
+      [ -f Package.resolved ] && cp Package.resolved dist/pkg/ || true
+      [ -d Sources ] && cp -a Sources dist/pkg/ || true
+      [ -f README.md ] && cp README.md dist/pkg/ || true
+      [ -f LICENSE ] && cp LICENSE dist/pkg/ || true
+      [ -f coverage.lcov ] && cp coverage.lcov dist/pkg/ || true
+
+      SHORT="${BUILD_SOURCEVERSION:0:7}"
+      BRANCH="${BUILD_SOURCEBRANCHNAME//\//-}"
+      pushd dist >/dev/null
+      zip -rq "PaymentPackage_src_${BRANCH}_v$(PACKAGE_VERSION)_${SHORT}.zip" pkg
+      popd >/dev/null
+
+      echo "Created dist/PaymentPackage_src_${BRANCH}_v$(PACKAGE_VERSION)_${SHORT}.zip"
+    displayName: "Create source artifact (.zip)"
+    condition: succeeded()
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish artifact: PaymentPackage (source zip)"
+    condition: succeeded()
+    inputs:
+      targetPath: 'dist'
+      artifact: 'PaymentPackage'
+
+  # Publish to Azure Artifacts feed (optional)
+  - task: UniversalPackages@0
+    displayName: "Artifacts feed: publish Universal Package v$(PACKAGE_VERSION)"
+    condition: succeeded()
+    inputs:
+      command: publish
+      publishDirectory: 'dist/pkg'
+      feedsToUse: internal
+      vstsFeedPublish: '$(FEED_PATH)'
+      vstsFeedPackagePublish: '$(PACKAGE_NAME)'
+      versionOption: custom
+      versionPublish: '$(PACKAGE_VERSION)'
+      packagePublishDescription: 'PaymentPackage source + coverage from $(Build.SourceVersion)'
+
+  # ---- GitHub mirroring (optional) ----
+  - script: |
+      echo "Repo: ${GITHUB_REPO}"
+      echo "Branch: ${GITHUB_DEFAULT_BRANCH}"
+      if [[ -n "${GITHUB_TOKEN:-}" ]]; then echo "Token: [present]"; else echo "Token: [missing]"; fi
+    displayName: "GitHub vars check"
+    env:
+      GITHUB_REPO: $(GITHUB_REPO)
+      GITHUB_DEFAULT_BRANCH: $(GITHUB_DEFAULT_BRANCH)
+      GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+  - script: |
+      set -euo pipefail
+
+      require_var() { local n="$1"; local v="${!n:-}"; if [[ -z "$v" || "$v" =~ ^\$\([A-Za-z0-9_.-]+\)$ ]]; then echo "ERROR: '$n' missing"; exit 1; fi; }
+      require_var GITHUB_TOKEN
+      require_var GITHUB_REPO
+      require_var GITHUB_DEFAULT_BRANCH
+
+      git remote remove github 2>/dev/null || true
+      git remote add github "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+      git push github "HEAD:refs/heads/${GITHUB_DEFAULT_BRANCH}"
+      echo "✅ Pushed to GitHub."
+    displayName: "GitHub: push commit to default branch"
+    condition: succeeded()
+    env:
+      GITHUB_TOKEN: $(GITHUB_TOKEN)
+      GITHUB_REPO: $(GITHUB_REPO)
+      GITHUB_DEFAULT_BRANCH: $(GITHUB_DEFAULT_BRANCH)
