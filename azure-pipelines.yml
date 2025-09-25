@@ -2,6 +2,7 @@
 # PaymentPackage – CI (release branch)
 # -------------------------------
 
+# Human-friendly run name:
 name: paymentpkg_release_$(Date:yyyyMMdd).$(Rev:r)
 
 trigger:
@@ -19,53 +20,54 @@ pr:
 
 pool:
   vmImage: macos-latest
-  
+
 variables:
   # Link Library variable group (must contain: GITHUB_TOKEN [secret], GITHUB_REPO)
   - group: PaymentPackage-Secrets
-  
-  # The pipeline variables
+
+  # Your pipeline variables (converted to list style)
   - name: GITHUB_DEFAULT_BRANCH
     value: main
+
   - name: CONFIG
     value: release
-    
+
   # SonarCloud
   - name: SONAR_ENABLED
     value: 'true'
   - name: SONARQ_ENDPOINT
-    value: 'sonarcloud-paymentpackage'  # Service Connection name in azure DevOps
+    value: 'sonarcloud-paymentpackage'
   - name: SONAR_ORG
     value: 'ciscode'
   - name: SONAR_PROJECT_KEY
-    value: 'To be set later'
+    value: 'CISCODEAPPS_pkg-ios-payment'
   - name: SONAR_PROJECT_NAME
     value: 'pkg-ios-payment'
-    
+
   # Azure Artifacts feed (optional)
   - name: FEED_PATH
     value: '$(System.TeamProject)/ios-packages'
   - name: PACKAGE_NAME
-    value: 'PaymentPackage'
-    
-  # Wil be overridden by version resolver
+    value: 'Paymentpackage'
+
+  # Will be overridden by version resolver
   - name: PACKAGE_VERSION
     value: '0.0.0-rc.0'
-    
+
 steps:
   # Ensure later git commands reuse OAuth token
-  - checkout: seld
+  - checkout: self
     fetchDepth: 0
     persistCredentials: true
-    displayName: "Checkout Repository"
-    
+    displayName: "Checkout repository"
+
   # Authenticated tag fetch (so versioning sees all tags)
   - script: |
-      set -euo pipefail 
+      set -euo pipefail
       git -c http.extraheader="AUTHORIZATION: bearer $(System.AccessToken)" \
-          fetch --tags --force --prune origin 
-    displayName: "Fetch tags (auth)"
-    
+          fetch --tags --force --prune origin
+    displayName: "Fetch tags (payment)"
+
   # ---------------------------------------------
   # Resolve PACKAGE_VERSION (simple)
   # - Tag build (refs/tags/vX.Y.Z) => X.Y.Z
@@ -77,6 +79,7 @@ steps:
       swift - <<'SWIFT'
       import Foundation
 
+      // MARK: - Helpers
       struct Env {
           static func get(_ key: String, required: Bool = true) -> String {
               let v = ProcessInfo.processInfo.environment[key] ?? ""
@@ -85,7 +88,9 @@ steps:
               return v
           }
       }
-      func setVar(_ name: String, _ value: String) { print("##vso[task.setvariable variable=\(name)]\(value)") }
+      func setVar(_ name: String, _ value: String) {
+          print("##vso[task.setvariable variable=\(name)]\(value)")
+      }
       func bumpPatch(_ version: String) -> String {
           let parts = version.split(separator: ".").map(String.init)
           guard parts.count == 3, let p = Int(parts[2]) else { return version }
@@ -96,24 +101,28 @@ steps:
           task.launchPath = launchPath
           task.arguments = args
           let pipe = Pipe(); task.standardOutput = pipe
+          let err = Pipe(); task.standardError = err
           task.launch(); task.waitUntilExit()
           let data = pipe.fileHandleForReading.readDataToEndOfFile()
           return (task.terminationStatus, String(data: data, encoding: .utf8) ?? "")
       }
 
-      let REF = Env.get("BUILD_SOURCEBRANCH", required: true)
+      // MARK: - Inputs
+      let REF = Env.get("BUILD_SOURCEBRANCH", required: true)            // e.g. refs/tags/v1.2.3 or refs/heads/release
       let buildId = Env.get("BUILD_BUILDID", required: true)
-      let feedPath = Env.get("FEED_PATH", required: true)
-      let packageName = Env.get("PACKAGE_NAME", required: true)
-      let orgUrlRaw = Env.get("SYSTEM_COLLECTIONURI", required: true)
+      let feedPath = Env.get("FEED_PATH", required: true)                // "<Project>/ios-packages"
+      let packageName = Env.get("PACKAGE_NAME", required: true)          // "paymentpackage"
+      let orgUrlRaw = Env.get("SYSTEM_COLLECTIONURI", required: true)    // "https://dev.azure.com/ORG/"
       let project = Env.get("SYSTEM_TEAMPROJECT", required: true)
       let token = Env.get("System_AccessToken", required: true)
 
       let orgUrl = orgUrlRaw.hasSuffix("/") ? String(orgUrlRaw.dropLast()) : orgUrlRaw
-      let feedName = feedPath.split(separator: "/").dropFirst().joined(separator: "/")
+      let feedName = feedPath.split(separator: "/").dropFirst().joined(separator: "/") // after "<Project>/"
       let baseApi = "\(orgUrl)/\(project)/_apis/packaging/feeds/\(feedName)"
 
+      // MARK: - Non-tag builds => RC like before
       if !REF.hasPrefix("refs/tags/v") {
+          // Find last vX.Y.Z tag via git
           var lastTag = ""
           let (code1, out1) = run("/usr/bin/env", ["git","describe","--tags","--abbrev=0","--match","v[0-9]*"])
           if code1 == 0 { lastTag = out1.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -137,24 +146,28 @@ steps:
           exit(0)
       }
 
+      // MARK: - Tag builds => X.Y.Z (or bump if duplicate in feed)
       let desired = String(REF.dropFirst("refs/tags/v".count))
       print("Tag build detected → desired = \(desired)")
       setVar("RELEASE_CHANNEL", "stable")
 
+      // Small JSON helpers
       func getJSON(url: URL, bearer: String) -> Any? {
           var req = URLRequest(url: url)
           req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
-          let sem = DispatchSemaphore(value: 0)
+          let sem = DispatchSemaphore(value: 1); sem.wait()
           var result: Any?
+          let done = DispatchSemaphore(value: 0)
           URLSession.shared.dataTask(with: req) { data, _, _ in
-              defer { sem.signal() }
+              defer { done.signal() }
               guard let d = data else { return }
               result = try? JSONSerialization.jsonObject(with: d, options: [])
           }.resume()
-          sem.wait()
+          done.wait()
           return result
       }
 
+      // Find package id (feed may be empty)
       let pkgURL = URL(string: "\(baseApi)/packages?packageNameQuery=\(packageName)&protocolType=upack&includeAllVersions=true&api-version=7.0-preview.1")!
       let pkgJSON = getJSON(url: pkgURL, bearer: token) as? [String: Any]
       let pkgId = ((pkgJSON?["value"] as? [[String: Any]])?.first?["id"] as? String) ?? ""
@@ -168,7 +181,7 @@ steps:
               if exists {
                   effective = bumpPatch(desired)
                   print("Version \(desired) already exists in feed → bumping to \(effective)")
-              } else {
+                } else {
                   print("Version \(desired) not present in feed → using it")
               }
           }
@@ -183,10 +196,13 @@ steps:
     env:
       System_AccessToken: $(System.AccessToken)
 
+
   - script: |
       set -euo pipefail
-      echo "Swift toolchain:"; swift --version
-      echo "Xcode:"; xcodebuild -version
+      echo "Swift toolchain:"
+      swift --version
+      echo "Xcode:"
+      xcodebuild -version
     displayName: "Show toolchain versions"
 
   - script: |
@@ -194,6 +210,7 @@ steps:
       echo "Running SwiftPM tests with coverage…"
       swift test --enable-code-coverage
 
+      # Locate coverage profile (newer toolchains)
       if swift test --show-codecov-path >/dev/null 2>&1; then
         CODECOV_JSON_PATH=$(swift test --show-codecov-path | tail -n1)
         PROF_DIR=$(dirname "$CODECOV_JSON_PATH")
@@ -202,6 +219,7 @@ steps:
         PROF=".build/debug/codecov/default.profdata"
       fi
 
+      # Test runner binary for llvm-cov
       if swift test --show-test-binary-path >/dev/null 2>&1; then
         TEST_BIN=$(swift test --show-test-binary-path)
       else
@@ -211,19 +229,22 @@ steps:
       echo "Coverage profile: $PROF"
       echo "Test binary: $TEST_BIN"
 
+      # Produce LCOV (for DevOps UI) + Swift text (for Sonar)
       xcrun llvm-cov export -format=lcov -instr-profile "$PROF" "$TEST_BIN" > coverage.lcov
       echo "Wrote coverage.lcov"
       xcrun llvm-cov show "$TEST_BIN" -instr-profile "$PROF" > coverage.swift.txt
       echo "Wrote coverage.swift.txt for SonarSwift"
     displayName: "Build & test (with coverage)"
 
+  # Convert LCOV to Cobertura XML for Azure DevOps UI
   - script: |
       set -euo pipefail
       python3 -m pip install --user lcov_cobertura
       python3 -m lcov_cobertura coverage.lcov --output coverage.cobertura.xml
       echo "Wrote coverage.cobertura.xml"
     displayName: "Convert coverage: LCOV → Cobertura XML"
-  
+
+  # Publish to the Code Coverage tab
   - task: PublishCodeCoverageResults@2
     displayName: "Publish code coverage (Cobertura)"
     inputs:
@@ -231,7 +252,8 @@ steps:
       summaryFileLocation: 'coverage.cobertura.xml'
       reportDirectory: 'coverage-html'
       failIfCoverageEmpty: false
-  
+
+  # Generate HTML coverage (optional)
   - script: |
       set -euo pipefail
       mkdir -p coverage-html
@@ -250,6 +272,7 @@ steps:
       xcrun llvm-cov show "$TEST_BIN" -instr-profile "$PROF" -format=html -output-dir coverage-html
     displayName: "Generate HTML coverage (optional)"
 
+  # Only publish HTML if the folder exists (Azure conditions don't support exists())
   - script: |
       if [ -d coverage-html ]; then
         echo "##vso[task.setvariable variable=PUBLISH_HTML]true"
@@ -265,9 +288,8 @@ steps:
     inputs:
       targetPath: 'coverage-html'
       artifact: 'coverage-html'
-  
-# ---- SonarCloud (v3 tasks) ----
 
+  # ---- SonarCloud (v3 tasks) ----
   - ${{ if eq(variables['SONAR_ENABLED'], 'true') }}:
     - task: SonarCloudPrepare@3
       displayName: "SonarCloud | Prepare analysis"
@@ -291,6 +313,7 @@ steps:
       condition: succeeded()
       inputs:
         pollingTimeoutSec: '600'
+  # -------------------------------
 
   - script: |
       set -euo pipefail
@@ -341,8 +364,12 @@ steps:
       versionOption: custom
       versionPublish: '$(PACKAGE_VERSION)'
       packagePublishDescription: 'PaymentPackage source + coverage from $(Build.SourceVersion)'
-
-  # ---- GitHub mirroring (optional) ----
+      
+ 
+  # ---------------------------------------------
+  # GitHub: push current build commit to default branch
+  # ---------------------------------------------
+  
   - script: |
       echo "Repo: ${GITHUB_REPO}"
       echo "Branch: ${GITHUB_DEFAULT_BRANCH}"
@@ -352,19 +379,31 @@ steps:
       GITHUB_REPO: $(GITHUB_REPO)
       GITHUB_DEFAULT_BRANCH: $(GITHUB_DEFAULT_BRANCH)
       GITHUB_TOKEN: $(GITHUB_TOKEN)
-
+    
   - script: |
       set -euo pipefail
 
-      require_var() { local n="$1"; local v="${!n:-}"; if [[ -z "$v" || "$v" =~ ^\$\([A-Za-z0-9_.-]+\)$ ]]; then echo "ERROR: '$n' missing"; exit 1; fi; }
+      # --- Guard: fail if any required var is missing OR left as an Azure placeholder like $(VAR) ---
+      require_var() {
+        local name="$1"
+        local val="${!name:-}"
+        if [[ -z "$val" || "$val" =~ ^\$\([A-Za-z0-9_.-]+\)$ ]]; then
+          echo "ERROR: Required variable '$name' is missing or unresolved. Set it in Pipeline variables."
+          exit 1
+        fi
+      }
       require_var GITHUB_TOKEN
       require_var GITHUB_REPO
       require_var GITHUB_DEFAULT_BRANCH
 
+      echo "Configuring GitHub remote for ${GITHUB_REPO}…"
       git remote remove github 2>/dev/null || true
       git remote add github "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+
+      echo "Pushing current commit to ${GITHUB_REPO}:${GITHUB_DEFAULT_BRANCH} (fast-forward only)…"
       git push github "HEAD:refs/heads/${GITHUB_DEFAULT_BRANCH}"
-      echo "✅ Pushed to GitHub."
+
+      echo "✅ Push complete."
     displayName: "GitHub: push commit to default branch"
     condition: succeeded()
     env:
