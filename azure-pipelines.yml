@@ -78,7 +78,7 @@ steps:
       set -euo pipefail
       swift - <<'SWIFT'
       import Foundation
-
+ 
       // MARK: - Helpers
       struct Env {
           static func get(_ key: String, required: Bool = true) -> String {
@@ -88,88 +88,85 @@ steps:
               return v
           }
       }
-      func setVar(_ name: String, _ value: String) {
-          print("##vso[task.setvariable variable=\(name)]\(value)")
-      }
-      func bumpPatch(_ version: String) -> String {
-          let parts = version.split(separator: ".").map(String.init)
-          guard parts.count == 3, let p = Int(parts[2]) else { return version }
+      func setVar(_ name: String, _ value: String) { print("##vso[task.setvariable variable=\(name)]\(value)") }
+
+      func bumpPatch(_ ver: String) -> String {
+          let parts = ver.split(separator: ".").map(String.init)
+          guard parts.count == 3, let p = Int(parts[2]) else { return ver }
           return "\(parts[0]).\(parts[1]).\(p+1)"
       }
-      func run(_ launchPath: String, _ args: [String]) -> (Int32, String) {
+
+      @discardableResult
+      func run(_ args: [String]) -> (Int32, String) {
           let task = Process()
-          task.launchPath = launchPath
+          task.launchPath = "/usr/bin/env"
           task.arguments = args
-          let pipe = Pipe(); task.standardOutput = pipe
-          let err = Pipe(); task.standardError = err
+          let out = Pipe(); task.standardOutput = out
           task.launch(); task.waitUntilExit()
-          let data = pipe.fileHandleForReading.readDataToEndOfFile()
-          return (task.terminationStatus, String(data: data, encoding: .utf8) ?? "")
-      }
+          let data = out.fileHandleForReading.readDataToEndOfFile()
+          return (task.terminationStatus, String(decoding: data, as: UTF8.self))
+      }  
 
-      // MARK: - Inputs
-      let REF = Env.get("BUILD_SOURCEBRANCH", required: true)            // e.g. refs/tags/v1.2.3 or refs/heads/release
-      let buildId = Env.get("BUILD_BUILDID", required: true)
-      let feedPath = Env.get("FEED_PATH", required: true)                // "<Project>/ios-packages"
-      let packageName = Env.get("PACKAGE_NAME", required: true)          // "paymentpackage"
-      let orgUrlRaw = Env.get("SYSTEM_COLLECTIONURI", required: true)    // "https://dev.azure.com/ORG/"
-      let project = Env.get("SYSTEM_TEAMPROJECT", required: true)
-      let token = Env.get("System_AccessToken", required: true)
-
+      // Inputs
+      let REF = Env.get("BUILD_SOURCEBRANCH")                 // refs/tags/vX.Y.Z or refs/heads/release
+      let buildId = Env.get("BUILD_BUILDID")
+      let feedPath = Env.get("FEED_PATH")
+      let packageName = Env.get("PACKAGE_NAME")
+      let orgUrlRaw = Env.get("SYSTEM_COLLECTIONURI")
+      let project = Env.get("SYSTEM_TEAMPROJECT")
+      let token = Env.get("System_AccessToken")
+  
       let orgUrl = orgUrlRaw.hasSuffix("/") ? String(orgUrlRaw.dropLast()) : orgUrlRaw
-      let feedName = feedPath.split(separator: "/").dropFirst().joined(separator: "/") // after "<Project>/"
+      let feedName = feedPath.split(separator: "/").dropFirst().joined(separator: "/")
       let baseApi = "\(orgUrl)/\(project)/_apis/packaging/feeds/\(feedName)"
 
-      // MARK: - Non-tag builds => RC like before
-      if !REF.hasPrefix("refs/tags/v") {
-          // Find last vX.Y.Z tag via git
-          var lastTag = ""
-          let (code1, out1) = run("/usr/bin/env", ["git","describe","--tags","--abbrev=0","--match","v[0-9]*"])
-          if code1 == 0 { lastTag = out1.trimmingCharacters(in: .whitespacesAndNewlines) }
-          if lastTag.isEmpty {
-              let (code2, out2) = run("/usr/bin/env", ["git","tag","-l","v[0-9]*","--sort=-v:refname"])
-              if code2 == 0 { lastTag = out2.split(separator: "\n").first.map(String.init) ?? "" }
-          }
-
-          var maj = 0, min = 0
-          if lastTag.hasPrefix("v") {
-              let base = String(lastTag.dropFirst())
-              let parts = base.split(separator: ".").map(String.init)
-              if parts.count >= 2 { maj = Int(parts[0]) ?? 0; min = Int(parts[1]) ?? 0 }
-          }
-          let nextMinor = "\(maj).\(min+1).0"
-          let date = ISO8601DateFormatter().string(from: Date()).prefix(10).replacingOccurrences(of: "-", with: "")
-          let ver = "\(nextMinor)-rc.\(date).\(buildId)"
-          print("RC build → PACKAGE_VERSION=\(ver)")
-          setVar("PACKAGE_VERSION", ver)
-          setVar("RELEASE_CHANNEL", "rc")
-          exit(0)
-      }
-
-      // MARK: - Tag builds => X.Y.Z (or bump if duplicate in feed)
-      let desired = String(REF.dropFirst("refs/tags/v".count))
-      print("Tag build detected → desired = \(desired)")
-      setVar("RELEASE_CHANNEL", "stable")
-
-      // Small JSON helpers
+      // Helper: GET JSON
       func getJSON(url: URL, bearer: String) -> Any? {
           var req = URLRequest(url: url)
           req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
-          let sem = DispatchSemaphore(value: 1); sem.wait()
+          let sem = DispatchSemaphore(value: 0)
           var result: Any?
-          let done = DispatchSemaphore(value: 0)
           URLSession.shared.dataTask(with: req) { data, _, _ in
-              defer { done.signal() }
+              defer { sem.signal() }
               guard let d = data else { return }
               result = try? JSONSerialization.jsonObject(with: d, options: [])
           }.resume()
-          done.wait()
+          sem.wait()
           return result
+      } 
+
+      // Non-tag builds → bump PATCH (not MINOR)
+      if !REF.hasPrefix("refs/tags/v") {
+          // Find last vX.Y.Z tag
+          var last = "v0.0.0"
+          let (c1, o1) = run(["git","describe","--tags","--abbrev=0","--match","v[0-9]*"])
+          if c1 == 0 {
+              last = o1.trimmingCharacters(in: .whitespacesAndNewlines)
+          } else {
+              let (c2, o2) = run(["git","tag","-l","v[0-9]*","--sort=-v:refname"])
+              if c2 == 0, let first = o2.split(separator: "\n").first {
+                  last = String(first)
+              }
+          }
+          // Derive next patch: from vX.Y.Z -> X.Y.(Z+1)-rc.DATE.BUILD
+          let base = last.hasPrefix("v") ? String(last.dropFirst()) : last
+          let nextPatch = bumpPatch(base)
+          let date = ISO8601DateFormatter().string(from: Date()).prefix(10).replacingOccurrences(of: "-", with: "")
+          let rc = "\(nextPatch)-rc.\(date).\(buildId)"
+          setVar("PACKAGE_VERSION", rc)
+          setVar("RELEASE_CHANNEL", "rc")
+          print("RC build → last=\(last) → PACKAGE_VERSION=\(rc)  (patch bump)")
+          exit(0)
       }
 
-      // Find package id (feed may be empty)
-      let pkgURL = URL(string: "\(baseApi)/packages?packageNameQuery=\(packageName)&protocolType=upack&includeAllVersions=true&api-version=7.0-preview.1")!
-      let pkgJSON = getJSON(url: pkgURL, bearer: token) as? [String: Any]
+      // Tag builds: keep X.Y.Z (bump patch only if duplicate exists in feed)
+      let desired = String(REF.dropFirst("refs/tags/v".count)) // X.Y.Z
+      setVar("RELEASE_CHANNEL", "stable")
+      print("Tag build detected → desired \(desired)")
+
+      // Query feed for duplicates
+      let listURL = URL(string: "\(baseApi)/packages?packageNameQuery=\(packageName)&protocolType=upack&includeAllVersions=true&api-version=7.0-preview.1")!
+      let pkgJSON = getJSON(url: listURL, bearer: token) as? [String: Any]
       let pkgId = ((pkgJSON?["value"] as? [[String: Any]])?.first?["id"] as? String) ?? ""
 
       var effective = desired
@@ -180,19 +177,19 @@ steps:
               let exists = arr.contains { ($0["version"] as? String) == desired }
               if exists {
                   effective = bumpPatch(desired)
-                  print("Version \(desired) already exists in feed → bumping to \(effective)")
-                } else {
-                  print("Version \(desired) not present in feed → using it")
+                  print("Version \(desired) already exists → bumping PATCH to \(effective)")
+              } else {
+                  print("Version \(desired) not present → using it")
               }
           }
       } else {
           print("Feed/package empty → using \(effective)")
-      }
+      } 
 
       setVar("PACKAGE_VERSION", effective)
       print("Resolved PACKAGE_VERSION=\(effective)")
       SWIFT
-    displayName: "Resolve package version (Swift)"
+    displayName: "Resolve package version (Swift) — patch bump"
     env:
       System_AccessToken: $(System.AccessToken)
 
