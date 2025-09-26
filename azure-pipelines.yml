@@ -36,7 +36,7 @@ variables:
   - name: SONAR_ENABLED
     value: 'true'
   - name: SONARQ_ENDPOINT
-    value: 'sonarcloud-paymentpackage'
+    value: 'sonarcloud-authpackage'
   - name: SONAR_ORG
     value: 'ciscode'
   - name: SONAR_PROJECT_KEY
