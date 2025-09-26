@@ -48,7 +48,7 @@ variables:
   - name: FEED_PATH
     value: '$(System.TeamProject)/ios-packages'
   - name: PACKAGE_NAME
-    value: 'Paymentpackage'
+    value: 'paymentpackage'
 
   # Will be overridden by version resolver
   - name: PACKAGE_VERSION
@@ -313,7 +313,7 @@ steps:
       condition: succeeded()
       inputs:
         pollingTimeoutSec: '600'
-      continueOnError: true             #Bypassing the Sonar issues for Azure's green pipeline 
+      continueOnError: true             #Bypassing the Sonar issues for Azure's green pipeline
   # -------------------------------
 
   - script: |
